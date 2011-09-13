@@ -182,8 +182,6 @@ module ActiveMerchant #:nodoc:
           add_address(xml, creditcard, options)   
         end
 
-        #puts "authorize: #{order}"
-
         commit_and_filter(order)
       end
       
@@ -326,9 +324,14 @@ module ActiveMerchant #:nodoc:
       def success?(response)
         if response[:message_type] == "R"
           response[:proc_status] == SUCCESS
+        elsif response[:message_type] == "A"
+          response[:proc_status] == SUCCESS && response[:approval_status] == '1' #According to Chase, resp_code does not need to be checked if approval_status == '1'
+        elsif response[:customer_profile_action] == "CREATE" || response[:customer_profile_action] == "UPDATE" || response[:customer_profile_action] == "READ"
+          response[:profile_proc_status] == SUCCESS
+        elsif response[:proc_status] == SUCCESS && response.keys.include?(:outstanding_amt)  && !response.keys.include?(:resp_code) #handle void
+          true
         else
-          response[:proc_status] == SUCCESS &&
-          response[:resp_code] == APPROVED 
+          response[:proc_status] == SUCCESS && ActiveMerchant::Billing::OrbitalGateway::APPROVAL_CODES.include?(response[:resp_code])
         end
       end
       
