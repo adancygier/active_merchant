@@ -28,19 +28,88 @@ module ActiveMerchant #:nodoc:
     # Company will automatically be affiliated.
     
     class OrbitalGateway < Gateway
-      API_VERSION = "4.6"
-      
+      # AD Reset this in intialize based on default and params.
+      API_VERSION = "5.2"
+
+      DEFAULT_API_VERSION = "5.2"    # Latest is 5.2
+      DEFAULT_BIN = '000002' # Tampa = 000002, Salem = 000001
+      DEFAULT_COUNTRY_CODE = 'CA'
+      DEFAULT_CURRENCY = 'CAD'
+      DEFAULT_TERMINAL_ID = '001'
+      DEFAULT_CLEAN_CC_FROM_RESPONSE = false;
+
       POST_HEADERS = {
         "MIME-Version" => "1.0",
-        "Content-Type" => "Application/PTI46",
+        "Content-Type" => "Application/PTI#{DEFAULT_API_VERSION.gsub(/[^\d]/, '')}",
         "Content-transfer-encoding" => "text",
         "Request-number" => '1',
         "Document-type" => "Request",
         "Interface-Version" => "Ruby|ActiveMerchant|Proprietary Gateway"
       }
       
-      SUCCESS, APPROVED = '0', '00'
-      
+      SUCCESS, APPROVED, VALIDATED, PRENOTED, NO_REASON_TO_DECLINE, RECANDSTORED, PROVIDEDAUTH, REQREC, BINALERT, APP_PARTIAL  = '0', '00', '24', '26', '27', '28', '29', '31', '32', '34'
+      APPROVAL_CODES = [APPROVED, VALIDATED, PRENOTED, NO_REASON_TO_DECLINE, RECANDSTORED, PROVIDEDAUTH, REQREC, BINALERT, APP_PARTIAL]
+
+      AVS_RETURN_CODES = {
+        '1' => 'No address supplied',
+        '2' => 'Bill-to address did not pass Auth Host edit check',
+        '3' => 'AVS not performed',
+        '4' => 'Issuer does not participate in AVS',
+        '5' => 'Edit-error - AVS data is invalid',
+        '6' => 'System unavailable or time-out',
+        '7' => 'Address information unavailable',
+        '8' => 'Transaction Ineligible for AVS',
+        '9' => 'Zip Match/Zip4 Match/Locale match',
+        'A' => 'Zip Match/Zip 4 Match/Locale no match',
+        'B' => 'Zip Match/Zip 4 no Match/Locale match',
+        'C' => 'Zip Match/Zip 4 no Match/Locale no match',
+        'D' => 'Zip No Match/Zip 4 Match/Locale match',
+        'E' => 'Zip No Match/Zip 4 Match/Locale no match',
+        'F' => 'Zip No Match/Zip 4 No Match/Locale match',
+        'G' => 'No match at all',
+        'H' => 'Zip Match/Locale match',
+        'J' => 'Issuer does not participate in Global AVS',
+        'JA' => 'International street address and postal match',
+        'JB' => ' International street address match. Postal code not verified.',
+        'JC' => 'International street address and postal code not verified.',
+        'JD' => 'International postal code match. Street address not verified.',
+        'M1' => 'Merchant Override Decline',
+        'M2' => 'Cardholder name, billing address, and postal code matches',
+        'M3' => 'Cardholder name and billing code matches',
+        'M4' => 'Cardholder name and billing address match',
+        'M5' => 'Cardholder name incorrect, billing address and postal code match',
+        'M6' => 'Cardholder name incorrect, billing address matches',
+        'M7' => 'Cardholder name incorrect, billing address matches',
+        'M8' => 'Cardholder name, billing address and postal code are all incorrect',
+        'N3' => 'Address matches, ZIP not verified',
+        'N4' => 'Address and ZIP code not verified due to incompatible formats',
+        'N5' => 'Address and ZIP code match (International only)',
+        'N6' => 'Address not verified (International only)',
+        'N7' => 'ZIP matches, address not verified',
+        'N8' => 'Address and ZIP code match (International only)',
+        'N9' => 'Address and ZIP code match (UK only)',
+        'R' => 'Issuer does not participate in AVS',
+        'UK' => 'Unknown',
+        'X' => 'Zip Match/Zip 4 Match/Address Match',
+        'Z' => 'Zip Match/Locale no match',
+      }
+
+      # These code classifications are specific to company x make this customizable
+      AVS_HARD_FAIL_CODES = ['D','E','F','G','JC','M1','M8','N4','JA','JB','JD','N5','N6','N8','N9','UK'] # rejected by provider
+      AVS_SOFT_FAIL_CODES = ['A','C','M4','M5','M6','M7','N3','N7','Z'] # could be an fraud issue
+      AVS_SERVICE_ERROR_CODES = ['1','2','3','4','5','6','7','8','J','R']
+      AVS_PASS_CODES = ['9','B','H','M2','M3','X']
+      AVS_BYPASS_AD = ['A','C','N7','Z'] # bypass street address check
+      AVS_HARD_UNEXPECTED_LOG = ['JA','JB','JD','N5','N6','N8','N9','UK'] # Log these unexpected errors.
+      CVV_FAIL_CODES = ['N', 'P', 'I', 'Y']
+
+      # zipcode errors
+      AVS_BAD_ZIP = ['D','E','F','G','N3','N4','JB','JC']
+
+      # These response codes should map to an invalid billing address
+      AVS_BAD_ADDRESS = ['C','E','G','JC','JD','M8','N4','N6','N7','Z']
+      FAILOVER_RETRIES = 3
+
       class_attribute :primary_test_url, :secondary_test_url, :primary_live_url, :secondary_live_url
       
       self.primary_test_url = "https://orbitalvar1.paymentech.net/authorize"
@@ -50,7 +119,7 @@ module ActiveMerchant #:nodoc:
       self.secondary_live_url = "https://orbital2.paymentech.net/authorize"
       
       self.supported_countries = ["US", "CA"]
-      self.default_currency = "CAD"
+      self.default_currency = DEFAULT_CURRENCY
       self.supported_cardtypes = [:visa, :master, :american_express, :discover, :diners_club, :jcb]
       
       self.display_name = 'Orbital Paymentech'
@@ -80,8 +149,29 @@ module ActiveMerchant #:nodoc:
       def initialize(options = {})
         unless options[:ip_authentication] == true
           requires!(options, :login, :password, :merchant_id)
-          @options = options
         end
+
+        @options = options
+        @logger = options[:logger] || (defined?(RAILS_DEFAULT_LOGGER) && RAILS_DEFAULT_LOGGER)
+        @options[:api_version] ||= DEFAULT_API_VERSION
+
+        ## set Content-Type header
+        POST_HEADERS["Content-Type"] = "Application/PTI#{@options[:api_version].gsub(/[^\d]/, '')}"
+
+        @options[:bin_id] ||= DEFAULT_BIN
+        @options[:terminal_id] ||= DEFAULT_TERMINAL_ID
+        @options[:country_code] ||= DEFAULT_COUNTRY_CODE
+        @options[:currency] ||= DEFAULT_CURRENCY
+        @options.has_key?(:clean_cc_from_response) || @options[:clean_cc_from_response] = DEFAULT_CLEAN_CC_FROM_RESPONSE
+        
+        if !@options.has_key?(:retry_safe) || @options[:retry_safe]
+          self.retry_safe = true
+        else
+          self.retry_safe = false
+        end
+        
+        self.class.default_currency = @options[:currency]
+
         super
       end
       
@@ -91,7 +181,10 @@ module ActiveMerchant #:nodoc:
           add_creditcard(xml, creditcard, options[:currency])        
           add_address(xml, creditcard, options)   
         end
-        commit(order)
+
+        #puts "authorize: #{order}"
+
+        commit_and_filter(order)
       end
       
       # AC – Authorization and Capture
@@ -100,7 +193,8 @@ module ActiveMerchant #:nodoc:
           add_creditcard(xml, creditcard, options[:currency])
           add_address(xml, creditcard, options)   
         end
-        commit(order)
+
+        commit_and_filter(order)
       end                       
       
       # MFC - Mark For Capture
@@ -113,7 +207,8 @@ module ActiveMerchant #:nodoc:
         order = build_new_order_xml('R', money, options.merge(:authorization => authorization)) do |xml|
           add_refund(xml, options[:currency])
         end
-        commit(order)
+
+        commit_and_filter(order)
       end
 
       def credit(money, authorization, options= {})
@@ -121,9 +216,13 @@ module ActiveMerchant #:nodoc:
         refund(money, authorization, options)
       end
       
+      # TODO add additions might be dependent on latest api version.
       # setting money to nil will perform a full void
       def void(money, authorization, options = {})
-        order = build_void_request_xml(money, authorization, options)
+        order = build_void_request_xml(money, authorization, options) do |xml|
+          add_online_reversal_ind_xml(xml, options[:online_reversal_ind]) if options[:online_reversal_ind] && @options[:api_version].to_f >= 5.2
+        end
+        @logger.debug("void request #{order.inspect}") if @logger
         commit(order)
       end
     
@@ -136,6 +235,8 @@ module ActiveMerchant #:nodoc:
         else
           xml.tag! :CustomerProfileFromOrderInd, 'A'
         end
+
+        xml.tag! :CustomerProfileOrderOverrideInd, options[:customer_profile_order_override_ind] if options[:customer_profile_order_override_ind]
       end
       
       def add_soft_descriptors(xml, soft_desc)
@@ -249,9 +350,9 @@ module ActiveMerchant #:nodoc:
             xml.tag! :OrbitalConnectionPassword, @options[:password] unless ip_authentication?
             xml.tag! :IndustryType, "EC" # E-Commerce transaction 
             xml.tag! :MessageType, action
-            xml.tag! :BIN, '000002' # PNS Tampa
+            xml.tag! :BIN, @options[:bin_id]
             xml.tag! :MerchantID, @options[:merchant_id]
-            xml.tag! :TerminalID, parameters[:terminal_id] || '001'            
+            xml.tag! :TerminalID, parameters[:terminal_id] || @options[:terminal_id]
             
             yield xml if block_given?
             
@@ -279,9 +380,9 @@ module ActiveMerchant #:nodoc:
             xml.tag! :OrbitalConnectionPassword, @options[:password] unless ip_authentication?
             xml.tag! :OrderID, order_id
             xml.tag! :Amount, amount(money)
-            xml.tag! :BIN, '000002' # PNS Tampa
+            xml.tag! :BIN, @options[:bin_id]
             xml.tag! :MerchantID, @options[:merchant_id]
-            xml.tag! :TerminalID, parameters[:terminal_id] || '001'
+            xml.tag! :TerminalID, parameters[:terminal_id] || @options[:terminal_id]
             xml.tag! :TxRefNum, tx_ref_num
           end
         end
@@ -301,12 +402,17 @@ module ActiveMerchant #:nodoc:
             xml.tag! :TxRefIdx, parameters[:transaction_index]
             xml.tag! :AdjustedAmt, amount(money)
             xml.tag! :OrderID, order_id
-            xml.tag! :BIN, '000002' # PNS Tampa
+            xml.tag! :BIN, @options[:bin_id]
             xml.tag! :MerchantID, @options[:merchant_id]
-            xml.tag! :TerminalID, parameters[:terminal_id] || '001'
+            xml.tag! :TerminalID, parameters[:terminal_id] || @options[:terminal_id]
+            yield xml if block_given?
           end
         end
         xml.target!
+      end
+
+      def add_online_reversal_ind_xml(xml, online_reversal_ind)
+        xml.tag! :OnlineReversalInd, online_reversal_ind
       end
       
       def currency_code(currency)
@@ -315,6 +421,22 @@ module ActiveMerchant #:nodoc:
       
       def expiry_date(credit_card)
         "#{format(credit_card.month, :two_digits)}#{format(credit_card.year, :two_digits)}"
+      end
+
+      # This method replaces a commit() with an optional method to clean cc cvv values from orbital response objects.
+      # Useful for those users who dont need this data and dont want to risk pci compliance issues related to logging or storing cc/cvv numbers inadvertantly.
+      def commit_and_filter(order)
+        response = commit(order)
+
+        remove_cc_from_response_hash(response) if @options[:clean_cc_from_response]
+
+        response
+      end
+
+      def remove_cc_from_response_hash(response)
+        if response.params.is_a?(Hash)
+          ['account_num', :account_num, 'cc_account_num', :cc_account_num].each { |key| response.params.delete(key) if response.params.has_key?(key) }
+        end
       end
     end
   end
