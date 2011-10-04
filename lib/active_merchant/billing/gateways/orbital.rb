@@ -37,6 +37,7 @@ module ActiveMerchant #:nodoc:
       DEFAULT_CURRENCY = 'CAD'
       DEFAULT_TERMINAL_ID = '001'
       DEFAULT_CLEAN_CC_FROM_RESPONSE = false;
+      DEFAULT_FAILOVER_RETRIES = 3 # Retry x times to override the default pass in :failover_reties => n into constructor
 
       POST_HEADERS = {
         "MIME-Version" => "1.0",
@@ -108,7 +109,6 @@ module ActiveMerchant #:nodoc:
 
       # These response codes should map to an invalid billing address
       AVS_BAD_ADDRESS = ['C','E','G','JC','JD','M8','N4','N6','N7','Z']
-      FAILOVER_RETRIES = 3
 
       class_attribute :primary_test_url, :secondary_test_url, :primary_live_url, :secondary_live_url
       
@@ -162,6 +162,7 @@ module ActiveMerchant #:nodoc:
         @options[:terminal_id] ||= DEFAULT_TERMINAL_ID
         @options[:country_code] ||= DEFAULT_COUNTRY_CODE
         @options[:currency] ||= DEFAULT_CURRENCY
+        @options[:failover_retries] ||= DEFAULT_FAILOVER_RETRIES
         @options.has_key?(:clean_cc_from_response) || @options[:clean_cc_from_response] = DEFAULT_CLEAN_CC_FROM_RESPONSE
         
         if !@options.has_key?(:retry_safe) || @options[:retry_safe]
@@ -186,15 +187,19 @@ module ActiveMerchant #:nodoc:
       end
       
       # AC – Authorization and Capture
-      def purchase(money, creditcard, options = {})
+      # Profile id is a customer_ref_num which maps to a pre existing credit card profile record in orbital
+      def purchase(money, creditcard_or_profile_id, options = {})
+        is_create_request = is_new_record?(creditcard_or_profile_id)
+
         order = build_new_order_xml('AC', money, options) do |xml|
-          add_creditcard(xml, creditcard, options[:currency])
-          add_address(xml, creditcard, options)   
+          add_creditcard(xml, creditcard_or_profile_id, options[:currency]) if is_create_request
+          is_create_request ? add_address(xml, creditcard_or_profile_id, options) : add_address(xml, nil, options)
+          add_customer_ref_num_xml(xml, creditcard_or_profile_id) unless is_create_request
         end
 
         commit_and_filter(order)
       end                       
-      
+
       # MFC - Mark For Capture
       def capture(money, authorization, options = {})
         commit(build_mark_for_capture_xml(money, authorization, options))
@@ -223,9 +228,89 @@ module ActiveMerchant #:nodoc:
         @logger.debug("void request #{order.inspect}") if @logger
         commit(order)
       end
+
+      # This method will be refactored to store_with_avs
+      # Write now get non avs check store working for testing purposes
+      def store_profile(creditcard, options = {})
+        ## Orbital requires a unique identifier per credit card there isn't an actual order associated with a store or update.
+        order_id = Time.now.to_f.to_s.gsub('.', '') 
+
+        parameters = {
+          :customer_ref_num => options[:customer_ref_num],
+          :order_id => order_id,
+          :customer_profile_order_override_ind => 'OI',
+        }
+
+        add_payment_source(parameters, creditcard)
+        add_addresses(parameters, options)
+
+        xml_request = is_update_profile_request?(creditcard) ? build_update_profile_xml(parameters) : build_new_profile_xml(parameters)
+
+        response = commit(xml_request)
+
+        ## remove cc_num from response hash at the source.  In profile create request the field is cc_account_num
+        remove_cc_from_response_hash(response)
+        
+        response
+      end
+
+      # customer_ref_num is billing_id in orbital (unique identifier for cc record)
+      def retrieve_profile(billing_id)
+        xml_request = build_retrieve_profile_xml({:customer_ref_num => billing_id})
+        commit(xml_request)
+      end 
     
       private                       
-            
+
+      def add_payment_source(params, source)
+        if source.is_a?(String)
+          add_customer_ref_num(params, source)
+        else
+          add_creditcard_params(params, source)
+        end
+      end 
+
+      def add_addresses(params, options)
+        address = options[:billing_address] || options[:address]
+
+        if address
+          params[:billing_address] = address
+          params[:address1]  = address[:address1] unless address[:address1].blank?
+          params[:address2]  = address[:address2] unless address[:address2].blank?
+          params[:city]      = address[:city]     unless address[:city].blank?
+          params[:state]     = address[:state]    unless address[:state].blank?
+          params[:zip]       = address[:zip]      unless address[:zip].blank?
+          params[:country]   = address[:country]  unless address[:country].blank?
+        end
+      end
+
+      # billing_id(trust_commerce uniq id) is actually customer_ref_num in orbitals system
+      def add_customer_ref_num(params, customer_ref_num)
+        params[:customer_ref_num] = customer_ref_num
+      end
+
+      def add_creditcard_params(params, creditcard)
+        params[:account_type] = 'CC'
+        params[:name] = creditcard.name
+        params[:cc] = creditcard.number
+        params[:exp] = expiry_date(creditcard)
+        #params[:cvv] = creditcard.verification_value if creditcard.verification_value?
+      end
+
+
+      # creditsource is either a string with billing_id(update) or a new credit_card object(create)
+      def is_update_profile_request?(creditsource)
+        creditsource.is_a?(String)
+      end
+
+      def is_new_record?(creditcard_or_profile_id)
+        !creditcard_or_profile_id.is_a?(String)
+      end
+
+      def add_customer_ref_num_xml(xml, profile_id)
+        xml.tag! :CustomerRefNum, profile_id.to_s 
+      end
+      
       def add_customer_data(xml, options)
         if options[:customer_ref_num]
           xml.tag! :CustomerProfileFromOrderInd, 'S'
@@ -254,7 +339,7 @@ module ActiveMerchant #:nodoc:
           xml.tag! :AVScity, address[:city]
           xml.tag! :AVSstate, address[:state]
           xml.tag! :AVSphoneNum, address[:phone] ? address[:phone].scan(/\d/).join.to_s : nil
-          xml.tag! :AVSname, creditcard.name
+          xml.tag! :AVSname, creditcard.name if creditcard
           xml.tag! :AVScountryCode, address[:country]
         end
       end
@@ -299,6 +384,13 @@ module ActiveMerchant #:nodoc:
       
       def commit(order)
         headers = POST_HEADERS.merge("Content-length" => order.size.to_s)
+
+        ## Preparing for refactoring of retry logic in original implementation
+        # Might need changes to core active_merchant methods.
+        retry_count = @options[:failover_retries] 
+        remote_url_lambda = lambda {return remote_url}
+        #####################################################################
+
         request = lambda {return parse(ssl_post(remote_url, order, headers))}
         
         # Failover URL will be used in the event of a connection error
@@ -312,7 +404,7 @@ module ActiveMerchant #:nodoc:
           }
         )
       end
-      
+
       def remote_url
         unless $!.class == ActiveMerchant::ConnectionError
           self.test? ? self.primary_test_url : self.primary_live_url
@@ -411,6 +503,91 @@ module ActiveMerchant #:nodoc:
             yield xml if block_given?
           end
         end
+        xml.target!
+      end
+
+      def build_new_profile_xml(params)
+        requires!(params, :cc, :exp)
+
+        xml = Builder::XmlMarkup.new(:indent => 2)
+        xml.instruct!(:xml, :version => '1.0', :encoding => 'UTF-8')
+        xml.tag! :Request do
+          xml.tag! :Profile do
+            xml.tag! :OrbitalConnectionUsername, @options[:login] unless ip_authentication?
+            xml.tag! :OrbitalConnectionPassword, @options[:password] unless ip_authentication?
+            xml.tag! :CustomerBin, @options[:bin_id]
+            xml.tag! :CustomerMerchantID, @options[:merchant_id]
+            xml.tag! :CustomerName, params[:name] if params[:name]
+            xml.tag! :CustomerAddress1, params[:address1] if params[:address1]
+            xml.tag! :CustomerAddress2, params[:address2] if params[:address2]
+            xml.tag! :CustomerCity, params[:city] if params[:city]
+            xml.tag! :CustomerState, params[:state] if params[:state]
+            xml.tag! :CustomerZIP, params[:zip] if params[:zip]
+            xml.tag! :CustomerEmail, params[:email] if params[:email]
+            xml.tag! :CustomerPhone, params[:phone] if params[:phone]
+            xml.tag! :CustomerCountryCode, @options[:country_code]
+            xml.tag! :CustomerProfileAction, 'C' #CRUD
+            xml.tag! :CustomerProfileOrderOverrideInd, 'OI'
+            xml.tag! :CustomerProfileFromOrderInd, 'A'
+            xml.tag! :CustomerAccountType, 'CC' # 'CC' credit card
+            xml.tag! :Status, 'A' # options[:status] # 'A', 'I', 'MS' ACTIVE INACTIVE MANUAL SUSPEND
+            xml.tag! :CCAccountNum, params[:cc] 
+            xml.tag! :CCExpireDate, params[:exp]
+          end
+        end
+
+        xml.target!
+      end
+
+      def build_update_profile_xml(params)
+        requires!(params, :customer_ref_num)
+
+        xml = Builder::XmlMarkup.new(:indent => 2)
+        xml.instruct!(:xml, :version => '1.0', :encoding => 'UTF-8')
+        xml.tag! :Request do
+          xml.tag! :Profile do
+            xml.tag! :OrbitalConnectionUsername, @options[:login] unless ip_authentication?
+            xml.tag! :OrbitalConnectionPassword, @options[:password] unless ip_authentication?
+            xml.tag! :CustomerBin, @options[:bin_id]
+            xml.tag! :CustomerMerchantID, @options[:merchant_id]
+            xml.tag! :CustomerName, params[:name] if params[:name]
+            xml.tag! :CustomerRefNum, params[:customer_ref_num] # Orbital autogenerated value 
+            xml.tag! :CustomerAddress1, params[:address1] if params[:address1]
+            xml.tag! :CustomerAddress2, params[:address2] if params[:address2]
+            xml.tag! :CustomerCity, params[:city] if params[:city]
+            xml.tag! :CustomerState, params[:state] if params[:state]
+            xml.tag! :CustomerZIP, params[:zip] if params[:zip]
+            xml.tag! :CustomerEmail, params[:email] if params[:email]
+            xml.tag! :CustomerPhone, params[:phone] if params[:phone]
+            xml.tag! :CustomerCountryCode, @options[:country_code]
+            xml.tag! :CustomerProfileAction, 'U' #CRUD
+            xml.tag! :CustomerProfileOrderOverrideInd, 'OI'
+            xml.tag! :CustomerAccountType, 'CC' # 'CC' credit card
+            xml.tag! :Status, 'A' # options[:status] # 'A', 'I', 'MS' ACTIVE INACTIVE MANUAL SUSPEND
+            xml.tag! :CCAccountNum, params[:cc] if params[:cc] 
+            xml.tag! :CCExpireDate, params[:exp] if params[:exp]
+          end
+        end
+
+        xml.target!
+      end
+
+      def build_retrieve_profile_xml(params)
+        requires!(params, :customer_ref_num)
+
+        xml = Builder::XmlMarkup.new(:indent => 2)
+        xml.instruct!(:xml, :version => '1.0', :encoding => 'UTF-8')
+        xml.tag! :Request do
+          xml.tag! :Profile do
+            xml.tag! :OrbitalConnectionUsername, @options[:login] unless ip_authentication?
+            xml.tag! :OrbitalConnectionPassword, @options[:password] unless ip_authentication?
+            xml.tag! :CustomerBin, @options[:bin_id]
+            xml.tag! :CustomerMerchantID, @options[:merchant_id]
+            xml.tag! :CustomerRefNum, params[:customer_ref_num]
+            xml.tag! :CustomerProfileAction, 'R'
+          end
+        end
+
         xml.target!
       end
 
