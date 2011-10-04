@@ -9,6 +9,8 @@ class OrbitalGatewayTest < Test::Unit::TestCase
       :password => 'password',
       :merchant_id => 'merchant_id'
     )
+
+    @valid_address ={:address1 => '123 Test St', :city => 'New York', :state => 'NY', :zip => '10010'}
   end  
   
   def test_successful_purchase
@@ -19,6 +21,16 @@ class OrbitalGatewayTest < Test::Unit::TestCase
     assert_success response
     assert_equal '4A5398CF9B87744GG84A1D30F2F2321C66249416;1', response.authorization
   end
+
+  def test_successful_purchase_profile_id
+    @gateway.expects(:ssl_post).returns(successful_purchase_response)
+    
+    assert response = @gateway.purchase(50, "12345678", :order_id => '1')
+    assert_instance_of Response, response
+    assert_success response
+    assert_equal '4A5398CF9B87744GG84A1D30F2F2321C66249416;1', response.authorization
+  end
+   
     
   def test_unauthenticated_response
     @gateway.expects(:ssl_post).returns(failed_purchase_response)
@@ -54,7 +66,29 @@ class OrbitalGatewayTest < Test::Unit::TestCase
     end.respond_with(successful_purchase_response)
     assert_success response
   end
-  
+
+  def test_successful_store_with_avs_create
+    @gateway.expects(:ssl_post).returns(succesful_store_with_avs_response)
+
+    assert response = @gateway.store_profile(credit_card, {:avs => 'Y', :avs_exempt => false, :billing_address => @valid_address,})
+    assert_instance_of Response, response
+    assert_success response
+    assert_equal '0', response.params['profile_proc_status']
+  end
+
+  def test_successful_store_with_avs_update
+    @gateway.expects(:ssl_post).returns(succesful_store_with_avs_response)
+    ActiveMerchant::Billing::OrbitalGateway.any_instance.stubs(:authorize).returns( {} )
+    ActiveMerchant::Billing::OrbitalGateway.any_instance.stubs(:validate_avs).returns( {} )
+    ActiveMerchant::Billing::OrbitalGateway.any_instance.stubs(:avs_success?).returns(true)
+    ActiveMerchant::Billing::OrbitalGateway.any_instance.stubs(:retrieve_profile).returns(Response.new(true, 'APPROVED',{'cc_expire_date' => '0912', 'cc_account_num' => '123456789', 'customer_account_type' => 'CC'}))
+
+    assert response = @gateway.store_profile("1234567", {:avs => 'Y', :avs_exempt => false, :billing_address => @valid_address,})
+    assert_instance_of Response, response
+    assert_success response
+    assert_equal '0', response.params['profile_proc_status']
+  end
+
   private
   
   # Place raw successful response from gateway here
@@ -66,5 +100,8 @@ class OrbitalGatewayTest < Test::Unit::TestCase
   def failed_purchase_response
     %q{<?xml version="1.0" encoding="UTF-8"?><Response><NewOrderResp><IndustryType></IndustryType><MessageType>AC</MessageType><MerchantID>700000000000</MerchantID><TerminalID>001</TerminalID><CardBrand>VI</CardBrand><AccountNum>4000300011112220</AccountNum><OrderID>1</OrderID><TxRefNum>4A5398CF9B87744GG84A1D30F2F2321C66249416</TxRefNum><TxRefIdx>0</TxRefIdx><ProcStatus>0</ProcStatus><ApprovalStatus>0</ApprovalStatus><RespCode>05</RespCode><AVSRespCode>G </AVSRespCode><CVV2RespCode>N</CVV2RespCode><AuthCode></AuthCode><RecurringAdviceCd></RecurringAdviceCd><CAVVRespCode></CAVVRespCode><StatusMsg>Do Not Honor</StatusMsg><RespMsg>AUTH DECLINED                   12001</RespMsg><HostRespCode>05</HostRespCode><HostAVSRespCode>N</HostAVSRespCode><HostCVV2RespCode>N</HostCVV2RespCode><CustomerRefNum></CustomerRefNum><CustomerName></CustomerName><ProfileProcStatus></ProfileProcStatus><CustomerProfileMessage></CustomerProfileMessage><RespTime>150214</RespTime></NewOrderResp></Response>}
   end
-  
+
+  def succesful_store_with_avs_response
+    %q{<?xml version="1.0" encoding="UTF-8"?><Response><NewOrderResp><IndustryType></IndustryType><MessageType>A</MessageType><MerchantID>197933</MerchantID><TerminalID>001</TerminalID><CardBrand>VI</CardBrand><AccountNum>4112344112344113</AccountNum><OrderID>1</OrderID><TxRefNum>4E30889E27F468ABDB854E0DFD314868E3D15473</TxRefNum><TxRefIdx>0</TxRefIdx><ProcStatus>0</ProcStatus><ApprovalStatus>1</ApprovalStatus><RespCode>27</RespCode><AVSRespCode>B </AVSRespCode><CVV2RespCode>M</CVV2RespCode><AuthCode>tst295</AuthCode><RecurringAdviceCd></RecurringAdviceCd><CAVVRespCode></CAVVRespCode><StatusMsg>No reason to decline</StatusMsg><RespMsg></RespMsg><HostRespCode>104</HostRespCode><HostAVSRespCode>I3</HostAVSRespCode><HostCVV2RespCode>M</HostCVV2RespCode><CustomerRefNum>11043046</CustomerRefNum><CustomerName>AARON DANCYGIER</CustomerName><ProfileProcStatus>0</ProfileProcStatus><CustomerProfileMessage>Profile Created</CustomerProfileMessage><RespTime>175230</RespTime></NewOrderResp></Response>}
+  end
 end
