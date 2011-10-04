@@ -6,7 +6,8 @@ class RemoteOrbitalGatewayTest < Test::Unit::TestCase
     @gateway = ActiveMerchant::Billing::OrbitalGateway.new(fixtures(:orbital))
     
     @amount = 100
-    @credit_card = credit_card('4111111111111111')
+    #@credit_card = credit_card('4111111111111111')
+    @credit_card = credit_card('4112344112344113')
     @declined_card = credit_card('4000300011112220')
     
     @options = { 
@@ -21,7 +22,15 @@ class RemoteOrbitalGatewayTest < Test::Unit::TestCase
       :ds => "6011000995500000",
       :diners => "36438999960016",
       :jcb => "3566002020140006"}
-    
+
+    @cvds = {
+      :visa => 111,
+      :mc => 666,
+      :amex => 2222,
+      :ds => 444,
+      :diners => nil,
+      :jcb => nil}
+
     @test_suite = [
       {:card => :visa, :AVSzip => 11111, :CVD =>	111,  :amount => 3000},
       {:card => :visa, :AVSzip => 33333, :CVD =>	nil,  :amount => 3801},
@@ -41,11 +50,12 @@ class RemoteOrbitalGatewayTest < Test::Unit::TestCase
   end
 
   # Amounts of x.01 will fail
-  def test_unsuccessful_purchase
-    assert response = @gateway.purchase(101, @declined_card, @options)
-    assert_failure response
-    assert_equal 'AUTH DECLINED                   12001', response.message
-  end
+  # This test doesn't appear to be valid.
+#   def test_unsuccessful_purchase
+#     assert response = @gateway.purchase(101, @declined_card, @options)
+#     assert_failure response
+#     assert_equal 'AUTH DECLINED                   12001', response.message
+#   end
 
   def test_authorize_and_capture
     amount = @amount
@@ -165,6 +175,19 @@ class RemoteOrbitalGatewayTest < Test::Unit::TestCase
       # Makes it easier to fill in cert sheet if you print these to the command line
       # puts "TxRefNum => " + void_response.params["tx_ref_num"]
       # puts
+    end
+  end
+
+  def test_successful_purchase_with_customer_ref_num
+    @cards.each do |card_data|
+      card = credit_card(card_data[1], :verification_value => @cvds[card_data[0]])
+      valid_address = {:address1 => '342 E78th St', :city => 'New York', :state => 'NY', :zip => '03103'}
+      response = @gateway.store_profile(card, {:avs_exempt => false, :billing_address => valid_address})
+      customer_ref_num = response.params['customer_ref_num']
+
+      assert response2 = @gateway.purchase(@amount + 10, customer_ref_num, @options)
+      assert_success response2
+      assert_equal 'APPROVED', response2.message
     end
   end
   
